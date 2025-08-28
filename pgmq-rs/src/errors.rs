@@ -14,7 +14,18 @@ pub enum PgmqError {
 
     /// a database error
     #[error("database error {0}")]
-    DatabaseError(#[from] sqlx::Error),
+    DatabaseError(
+        #[cfg(feature = "deadpool-postgres")]
+        #[from]
+        tokio_postgres::Error,
+        #[cfg(feature = "sqlx")]
+        #[from]
+        sqlx::Error,
+    ),
+
+    #[cfg(feature = "deadpool-postgres")]
+    #[error("database pool error {0}")]
+    DatabasePoolError(#[from] deadpool_postgres::PoolError),
 
     /// a queue name error
     /// queue names must be alphanumeric and start with a letter

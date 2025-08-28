@@ -4,7 +4,11 @@ use crate::errors::PgmqError;
 use crate::types::{ARCHIVE_PREFIX, PGMQ_SCHEMA, QUEUE_PREFIX};
 use crate::util::{check_input, CheckedName};
 
-use sqlx::types::chrono::Utc;
+#[cfg(feature = "deadpool-postgres")]
+use chrono::{DateTime, Utc};
+
+#[cfg(not(feature = "deadpool-postgres"))]
+use sqlx::types::chrono::{DateTime, Utc};
 
 pub fn init_queue_client_only(name: &str, is_unlogged: bool) -> Result<Vec<String>, PgmqError> {
     let name = CheckedName::new(name)?;
@@ -195,7 +199,7 @@ pub fn read(name: &str, vt: i32, limit: i32) -> Result<String, PgmqError> {
     ))
 }
 
-pub fn set_vt(name: &str, msg_id: i64, vt: chrono::DateTime<Utc>) -> Result<String, PgmqError> {
+pub fn set_vt(name: &str, msg_id: i64, vt: DateTime<Utc>) -> Result<String, PgmqError> {
     check_input(name)?;
     Ok(format!(
         "

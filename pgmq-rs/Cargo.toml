@@ -1,32 +1,49 @@
 [package]
-name = "pgmq"
-version = "0.31.0"
-edition = "2021"
-authors = ["PGMQ Maintainers"]
-description = "A distributed message queue for Rust applications, on Postgres."
+name          = "pgmq"
+version       = "0.31.0"
+edition       = "2021"
+authors       = ["PGMQ Maintainers"]
+description   = "A distributed message queue for Rust applications, on Postgres."
 documentation = "https://docs.rs/pgmq"
-homepage = "https://github.com/pgmq/pgmq"
-keywords = ["messaging", "queues", "postgres"]
-license = "PostgreSQL"
-readme = "README.md"
-repository = "https://github.com/pgmq/pgmq"
+homepage      = "https://github.com/pgmq/pgmq"
+keywords      = ["messaging", "postgres", "queues"]
+license       = "PostgreSQL"
+readme        = "README.md"
+repository    = "https://github.com/pgmq/pgmq"
 
 [[bin]]
-name = "pgmq-cli"
-path = "src/bin/pgmq-cli.rs"
+name              = "pgmq-cli"
+path              = "src/bin/pgmq-cli.rs"
 required-features = ["cli"]
 
 [features]
-default = []
-cli = ["clap", "futures-util", "reqwest", "tokio/rt"]
+default = ["chrono", "sqlx"]
+cli     = ["clap", "futures-util", "reqwest", "tokio/rt"]
+chrono  = ["dep:chrono"]
+sqlx    = []
+
+deadpool-postgres = [
+    "dep:chrono",
+    "dep:deadpool-postgres",
+    "dep:tokio-postgres"
+]
+
 
 [dependencies]
-chrono = { version = "0.4.23", features = ["serde"] }
+chrono = { version = "0.4.23", features = ["serde"], optional = true }
 serde = { version = "1.0.152" }
 serde_json = { version = "1.0.91", features = ["raw_value"] }
-sqlx = { version = "0.8.1", features = ["runtime-tokio", "postgres", "chrono", "json"] }
+sqlx = { version = "0.8.1", features = [
+    "chrono",
+    "json",
+    "postgres",
+    "runtime-tokio"
+] }
 thiserror = "1.0.38"
-tokio = { version = "1", default-features = false, features = ["macros", "time"] }
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "time"
+] }
 log = "0.4.17"
 url = "2.3.1"
 
@@ -34,16 +51,25 @@ url = "2.3.1"
 reqwest = { version = "0.11", features = ["json"], optional = true }
 futures-util = { version = "0.3.31", optional = true }
 clap = { version = "4.0", features = ["derive"], optional = true }
+tokio-postgres = { version = "0.7.13", optional = true, features = [
+    "with-chrono-0_4",
+    "with-serde_json-1"
+] }
+deadpool-postgres = { version = "0.14.1", optional = true, features = [
+    "serde"
+] }
+match_cfg = "0.1.0"
+cfg-if = "1.0.3"
 
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
 cargo-readme = "3.2.0"
-criterion = "0.4"
-env_logger = "0.10.0"
-rand = "0.8.5"
-regex = "1.5.4"
-lazy_static = "1.4.0"
+criterion    = "0.4"
+env_logger   = "0.10.0"
+rand         = "0.8.5"
+regex        = "1.5.4"
+lazy_static  = "1.4.0"
 
 # If a consumer has both the `time` and `chrono` features of `sqlx` enabled, `sqlx` will default to using
 # `OffsetDateTime` (from `time`) for timestamp fields instead of `DateTime<Utc>` (from `chrono`), causing a compilation

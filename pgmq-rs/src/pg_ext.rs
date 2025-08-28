@@ -1,12 +1,21 @@
 use crate::errors::PgmqError;
 use crate::types::{Message, QUEUE_PREFIX};
+#[cfg(feature = "sqlx")]
+use crate::util::connect;
 #[cfg(feature = "cli")]
 use crate::util::install_pgmq;
-use crate::util::{check_input, connect};
+use crate::util::{check_input, Connection};
+
+#[cfg(feature = "chrono")]
+use chrono::{DateTime, Utc};
+#[cfg(feature = "deadpool-postgres")]
+use deadpool_postgres::GenericClient;
 use log::info;
 use serde::{Deserialize, Serialize};
-use sqlx::types::chrono::Utc;
-use sqlx::{Pool, Postgres};
+
+#[cfg(not(feature = "deadpool-postgres"))]
+use sqlx::{Postgres, Row};
+
 
 const DEFAULT_POLL_TIMEOUT_S: i32 = 5;
 const DEFAULT_POLL_INTERVAL_MS: i32 = 250;
@@ -15,17 +24,18 @@ const DEFAULT_POLL_INTERVAL_MS: i32 = 250;
 #[derive(Clone, Debug)]
 pub struct PGMQueueExt {
     pub url: String,
-    pub connection: Pool<Postgres>,
+    pub connection: Connection,
 }
 
 pub struct PGMQueueMeta {
     pub queue_name: String,
-    pub created_at: chrono::DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
     pub is_unlogged: bool,
     pub is_partitioned: bool,
 }
 impl PGMQueueExt {
     /// Initialize a connection to PGMQ/Postgres
+    #[cfg(feature = "sqlx")]
     pub async fn new(url: String, max_connections: u32) -> Result<Self, PgmqError> {
         Ok(Self {
             connection: connect(&url, max_connections).await?,
@@ -35,7 +45,7 @@ impl PGMQueueExt {
 
     /// BYOP  - bring your own pool
     /// initialize a PGMQ connection with your own SQLx Postgres connection pool
-    pub async fn new_with_pool(pool: Pool<Postgres>) -> Self {
+    pub async fn new_with_pool(pool: Connection) -> Self {
         Self {
             url: "".to_owned(),
             connection: pool,
@@ -56,33 +66,41 @@ impl PGMQueueExt {
         self.install_sql_with_cxn(&self.connection, version).await
     }
 
-    pub async fn init_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
-        &self,
-        executor: E,
-    ) -> Result<bool, PgmqError> {
-        sqlx::query!("CREATE EXTENSION IF NOT EXISTS pgmq CASCADE;")
-            .execute(executor)
-            .await
-            .map(|_| true)
-            .map_err(PgmqError::from)
+    pub async fn init_with_cxn(&self, executor: &Connection) -> Result<bool, PgmqError> {
+        let query = "CREATE EXTENSION IF NOT EXISTS pgmq CASCADE;";
+
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                executor.get().await?.execute(query, &[]).await?;
+                Ok(true)
+            } else {
+                sqlx::query(query)
+                    .execute(executor)
+                    .await
+                    .map(|_| true)
+                    .map_err(PgmqError::from)
+            }
+        }
     }
 
     pub async fn init(&self) -> Result<bool, PgmqError> {
         self.init_with_cxn(&self.connection).await
     }
 
-    pub async fn create_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
+    pub async fn create_with_cxn(
         &self,
         queue_name: &str,
-        executor: E,
+        executor: &Connection,
     ) -> Result<bool, PgmqError> {
         check_input(queue_name)?;
-        sqlx::query!(
-            "SELECT * from pgmq.create(queue_name=>$1::text);",
-            queue_name
-        )
-        .execute(executor)
-        .await?;
+        let stmt = "SELECT * from pgmq.create(queue_name=>$1::text);";
+        cfg_if::cfg_if! {
+            if #[cfg(feature="deadpool-postgres")] {
+                executor.get().await?.query(stmt, &[]).await?;
+            } else {
+                sqlx::query(stmt).bind(queue_name).execute(executor).await?;
+            }
+        }
         Ok(true)
     }
     /// Errors when there is any database error and Ok(false) when the queue already exists.
@@ -91,18 +109,23 @@ impl PGMQueueExt {
         Ok(true)
     }
 
-    pub async fn create_unlogged_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
+    pub async fn create_unlogged_with_cxn(
         &self,
         queue_name: &str,
-        executor: E,
+        executor: &Connection,
     ) -> Result<bool, PgmqError> {
         check_input(queue_name)?;
-        sqlx::query!(
-            "SELECT * from pgmq.create_unlogged(queue_name=>$1::text);",
-            queue_name
-        )
-        .execute(executor)
-        .await?;
+        let stmt = "SELECT * from pgmq.create_unlogged(queue_name=>$1::text);";
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                executor.get().await?.query(stmt, &[]).await?;
+            } else {
+                sqlx::query(stmt)
+                .bind(queue_name)
+                .execute(executor)
+                .await?;
+            }
+        }
         Ok(true)
     }
 
@@ -113,33 +136,42 @@ impl PGMQueueExt {
         Ok(true)
     }
 
-    pub async fn create_partitioned_with_cxn<
-        'c,
-        E: sqlx::Executor<'c, Database = Postgres> + std::marker::Copy,
-    >(
+    pub async fn create_partitioned_with_cxn(
         &self,
         queue_name: &str,
-        executor: E,
+        executor: &Connection,
     ) -> Result<bool, PgmqError> {
         check_input(queue_name)?;
         let queue_table = format!("pgmq.{QUEUE_PREFIX}_{queue_name}");
         // we need to check whether the queue exists first
         // pg_partman create operations are currently unable to be idempotent
         let exists_stmt = "SELECT EXISTS(SELECT * from part_config where parent_table = $1);";
-        let exists = sqlx::query_scalar(exists_stmt)
-            .bind(queue_table)
-            .fetch_one(executor)
-            .await?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                let client = executor.get().await?;
+                let exists = client.query_one(exists_stmt, &[&queue_table]).await?.get(0);
+            } else {
+                let exists = sqlx::query_scalar(exists_stmt)
+                    .bind(queue_table)
+                    .fetch_one(executor)
+                    .await?;
+            }
+        }
         if exists {
             info!("queue: {queue_name} already exists",);
             Ok(false)
         } else {
-            sqlx::query!(
-                "SELECT * from pgmq.create_partitioned(queue_name=>$1::text);",
-                queue_name
-            )
-            .execute(executor)
-            .await?;
+            let stmt = "SELECT * from pgmq.create_partitioned(queue_name=>$1::text);";
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "deadpool-postgres")] {
+                    client.query(stmt, &[&queue_name]).await?;
+                } else {
+                    sqlx::query(stmt)
+                    .bind(queue_name)
+                    .execute(executor)
+                    .await?;
+                }
+            }
             Ok(true)
         }
     }
@@ -151,18 +183,23 @@ impl PGMQueueExt {
             .await
     }
 
-    pub async fn drop_queue_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
+    pub async fn drop_queue_with_cxn(
         &self,
         queue_name: &str,
-        executor: E,
+        executor: &Connection,
     ) -> Result<(), PgmqError> {
         check_input(queue_name)?;
-        executor
-            .execute(sqlx::query!(
-                "SELECT * from pgmq.drop_queue(queue_name=>$1::text);",
-                queue_name
-            ))
-            .await?;
+        let stmt = "SELECT * from pgmq.drop_queue(queue_name=>$1::text);";
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                executor.get().await?.execute(stmt, &[&queue_name]).await?;
+            } else {
+                sqlx::query(stmt)
+                .bind("queue_name")
+                .execute(executor)
+                    .await?;
+            }
+        }
 
         Ok(())
     }
@@ -173,20 +210,27 @@ impl PGMQueueExt {
     }
 
     /// Drop an existing queue table.
-    pub async fn purge_queue_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
+    pub async fn purge_queue_with_cxn(
         &self,
         queue_name: &str,
-        executor: E,
+        executor: &Connection,
     ) -> Result<i64, PgmqError> {
         check_input(queue_name)?;
-        let purged = sqlx::query!(
-            "SELECT * from pgmq.purge_queue(queue_name=>$1::text);",
-            queue_name
-        )
-        .fetch_one(executor)
-        .await?;
+        let stmt = "SELECT * from pgmq.purge_queue(queue_name=>$1::text);";
 
-        Ok(purged.purge_queue.expect("no purged count"))
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                let client = executor.get().await?;
+                Ok(client.query_one(stmt, &[&queue_name]).await?.get(0))
+            } else {
+                let purged = sqlx::query(stmt)
+                .bind(queue_name)
+                .fetch_one(executor)
+                .await?;
+
+                Ok(purged.try_get("purge_queue")?)
+            }
+        }
     }
 
     /// Drop an existing queue table.
@@ -195,25 +239,43 @@ impl PGMQueueExt {
             .await
     }
 
-    pub async fn list_queues_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
+    pub async fn list_queues_with_cxn(
         &self,
-        executor: E,
+        executor: &Connection,
     ) -> Result<Option<Vec<PGMQueueMeta>>, PgmqError> {
-        let queues = sqlx::query!(r#"SELECT queue_name, is_partitioned, is_unlogged, created_at as "created_at: chrono::DateTime<Utc>" from pgmq.list_queues();"#)
-            .fetch_all(executor)
-            .await?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                let queues = executor.get().await?.query(r#"SELECT queue_name, is_partitioned, is_unlogged, created_at as "created_at: chrono::DateTime<Utc>" from pgmq.list_queues();"#, &[]).await?;
+            } else {
+                let queues = sqlx::query!(r#"SELECT queue_name, is_partitioned, is_unlogged, created_at as "created_at: chrono::DateTime<Utc>" from pgmq.list_queues();"#).fetch_all(executor).await?;
+            }
+        }
         if queues.is_empty() {
             Ok(None)
         } else {
-            let queues = queues
-                .into_iter()
-                .map(|q| PGMQueueMeta {
-                    queue_name: q.queue_name.expect("queue_name missing"),
-                    created_at: q.created_at.expect("created_at missing"),
-                    is_unlogged: q.is_unlogged.expect("is_unlogged missing"),
-                    is_partitioned: q.is_partitioned.expect("is_partitioned missing"),
-                })
-                .collect();
+            cfg_if::cfg_if! {
+                if #[cfg(feature="deadpool-postgres")] {
+                    let queues = queues.iter().map(|q| {
+                        PGMQueueMeta {
+                            queue_name: q.try_get("queue_name").expect("queue_name missing"),
+                            created_at: q.try_get("created_at").expect("created_at missing"),
+                            is_unlogged: q.try_get("is_unlogged").expect("is_unlogged missing"),
+                            is_partitioned: q.try_get("is_partitioned").expect("is_partitioned missing"),
+                        }
+                    }).collect::<Vec<_>>();
+                } else {
+                    let queues = queues
+                        .into_iter()
+                        .map(|q| PGMQueueMeta {
+                            queue_name: q.queue_name.expect("queue_name missing"),
+                            created_at: q.created_at.expect("created_at missing"),
+                            is_unlogged: q.is_unlogged.expect("is_unlogged missing"),
+                            is_partitioned: q.is_partitioned.expect("is_partitioned missing"),
+                        })
+                        .collect();
+                }
+
+            }
             Ok(Some(queues))
         }
     }
@@ -223,37 +285,54 @@ impl PGMQueueExt {
         self.list_queues_with_cxn(&self.connection).await
     }
 
-    pub async fn set_vt_with_cxn<
-        'c,
-        E: sqlx::Executor<'c, Database = Postgres>,
-        T: for<'de> Deserialize<'de>,
-    >(
+    pub async fn set_vt_with_cxn<T: for<'de> Deserialize<'de>>(
         &self,
         queue_name: &str,
         msg_id: i64,
         vt: i32,
-        executor: E,
+        executor: &Connection,
     ) -> Result<Message<T>, PgmqError> {
         check_input(queue_name)?;
         // queue_name, created_at as "created_at: chrono::DateTime<Utc>", is_partitioned, is_unlogged
-        let updated = sqlx::query!(
-            r#"SELECT msg_id, read_ct, enqueued_at as "enqueued_at: chrono::DateTime<Utc>", vt as "vt: chrono::DateTime<Utc>", message from pgmq.set_vt(queue_name=>$1::text, msg_id=>$2::bigint, vt=>$3::integer);"#,
-            queue_name,
-            msg_id,
-            vt
-        )
-        .fetch_one(executor)
-        .await?;
-        let raw_msg = updated.message.expect("no message");
-        let parsed_msg = serde_json::from_value::<T>(raw_msg)?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature="deadpool-postgres")] {
+                let row = executor.get().await?
+                .query_one(
+                   r#"SELECT msg_id, read_ct, enqueued_at as "enqueued_at: chrono::DateTime<Utc>", vt as "vt: chrono::DateTime<Utc>", message from pgmq.set_vt(queue_name=>$1::text, msg_id=>$2::bigint, vt=>$3::integer);"#,
+                   &[&queue_name, &msg_id, &vt]
+                ).await?;
 
-        Ok(Message {
-            msg_id: updated.msg_id.expect("msg_id missing"),
-            vt: updated.vt.expect("vt missing"),
-            read_ct: updated.read_ct.expect("read_ct missing"),
-            enqueued_at: updated.enqueued_at.expect("enqueued_at missing"),
-            message: parsed_msg,
-        })
+                let raw_msg: serde_json::Value = row.try_get("message")?;
+                let message = serde_json::from_value::<T>(raw_msg)?;
+
+                Ok(Message {
+                    msg_id: row.try_get("msg_id")?,
+                    vt: row.try_get("vt")?,
+                    read_ct: row.try_get("read_ct")?,
+                    enqueued_at: row.try_get("enqueued_at")?,
+                    message,
+                })
+            } else {
+               let updated = sqlx::query!(
+                   r#"SELECT msg_id, read_ct, enqueued_at as "enqueued_at: chrono::DateTime<Utc>", vt as "vt: chrono::DateTime<Utc>", message from pgmq.set_vt(queue_name=>$1::text, msg_id=>$2::bigint, vt=>$3::integer);"#,
+                   queue_name,
+                   msg_id,
+                   vt
+               )
+               .fetch_one(executor)
+               .await?;
+               let raw_msg = updated.message.expect("no message");
+               let parsed_msg = serde_json::from_value::<T>(raw_msg)?;
+
+                Ok(Message {
+                    msg_id: updated.msg_id.expect("msg_id missing"),
+                    vt: updated.vt.expect("vt missing"),
+                    read_ct: updated.read_ct.expect("read_ct missing"),
+                    enqueued_at: updated.enqueued_at.expect("enqueued_at missing"),
+                    message: parsed_msg,
+                })
+            }
+        }
     }
     // Set the visibility time on an existing message.
     pub async fn set_vt<T: for<'de> Deserialize<'de>>(
@@ -266,7 +345,26 @@ impl PGMQueueExt {
             .await
     }
 
-    pub async fn send_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>, T: Serialize>(
+    #[cfg(feature="deadpool-postgres")]
+    pub async fn send_with_cxn<E: GenericClient, T: Serialize>(
+        &self,
+        queue_name: &str,
+        message: &T,
+        executor: &E,
+    ) -> Result<i64, PgmqError> {
+        check_input(queue_name)?;
+        let msg = serde_json::json!(&message);
+        let msg_id = executor
+            .query_one(
+                "SELECT send as msg_id from pgmq.send(queue_name=>$1::text, msg=>$2::jsonb, delay=>0::integer);",
+                &[&queue_name, &msg]
+            ).await?.try_get::<&str, i64>("msg_id")?;
+
+        Ok(msg_id)
+    }
+
+    #[cfg(feature = "sqlx")]
+    pub async fn send_with_cxn<'c, E: sqlx::Executor<'c, Database = sqlx::Postgres>, T: Serialize>(
         &self,
         queue_name: &str,
         message: &T,
@@ -274,6 +372,7 @@ impl PGMQueueExt {
     ) -> Result<i64, PgmqError> {
         check_input(queue_name)?;
         let msg = serde_json::json!(&message);
+
         let prepared = sqlx::query!(
             "SELECT send as msg_id from pgmq.send(queue_name=>$1::text, msg=>$2::jsonb, delay=>0::integer);",
             queue_name,
@@ -288,32 +387,47 @@ impl PGMQueueExt {
         queue_name: &str,
         message: &T,
     ) -> Result<i64, PgmqError> {
-        self.send_with_cxn(queue_name, message, &self.connection)
+        self.send_with_cxn(queue_name, message, 
+            #[cfg(feature="deadpool-postgres")]
+            &self.connection.get().await?,
+            #[cfg(feature="sqlx")]
+            &self.connection
+        )
             .await
     }
 
-    pub async fn send_delay_with_cxn<
-        'c,
-        E: sqlx::Executor<'c, Database = Postgres>,
-        T: Serialize,
-    >(
+    pub async fn send_delay_with_cxn<T: Serialize>(
         &self,
         queue_name: &str,
         message: &T,
         delay: u32,
-        executor: E,
+        executor: &Connection,
     ) -> Result<i64, PgmqError> {
         check_input(queue_name)?;
         let msg = serde_json::json!(&message);
-        let sent = sqlx::query!(
-            "SELECT send as msg_id from pgmq.send(queue_name=>$1::text, msg=>$2::jsonb, delay=>$3::int);",
-            queue_name,
-            msg,
-            delay as i32
-        )
-        .fetch_one(executor)
-        .await?;
-        Ok(sent.msg_id.expect("no message id"))
+        let query = 
+                    "SELECT send as msg_id from pgmq.send(queue_name=>$1::text, msg=>$2::jsonb, delay=>$3::int);";
+
+        cfg_if::cfg_if! {
+            if #[cfg(feature="deadpool-postgres")] {
+                let msg_id = executor
+                .get()
+                .await?
+                .query_one(query, &[&queue_name, &msg, &(delay as i32)])
+                .await?
+                .try_get("msg_id")?;
+                Ok(msg_id)
+            } else {
+                let sent = sqlx::query(query)
+                .bind(queue_name)
+                .bind(msg)
+                .bind(delay as i32)
+                .fetch_one(executor)
+                .await?;
+
+                Ok(sent.try_get("msg_id")?)
+            }
+        }
     }
 
     pub async fn send_delay<T: Serialize>(
@@ -326,37 +440,42 @@ impl PGMQueueExt {
             .await
     }
 
-    pub async fn read_with_cxn<
-        'c,
-        E: sqlx::Executor<'c, Database = Postgres>,
-        T: for<'de> Deserialize<'de>,
-    >(
+    pub async fn read_with_cxn<'c, T: for<'de> Deserialize<'de>>(
         &self,
         queue_name: &str,
         vt: i32,
-        executor: E,
+        executor: &Connection,
     ) -> Result<Option<Message<T>>, PgmqError> {
         check_input(queue_name)?;
-        let row = sqlx::query!(
-            r#"SELECT msg_id, read_ct, enqueued_at as "enqueued_at: chrono::DateTime<Utc>", vt as "vt: chrono::DateTime<Utc>", message from pgmq.read(queue_name=>$1::text, vt=>$2::integer, qty=>$3::integer)"#,
-            queue_name,
-            vt,
-            1
-        )
-        .fetch_optional(executor)
-        .await?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                let row = executor.get().await?.query_opt(
+                    r#"SELECT msg_id, read_ct, enqueued_at as "enqueued_at: chrono::DateTime<Utc>", vt as "vt: chrono::DateTime<Utc>", message from pgmq.read(queue_name=>$1::text, vt=>$2::integer, qty=>$3::integer)"#,
+                    &[&queue_name, &vt, &1]
+                ).await?;
+            } else {
+                let row = sqlx::query(
+                    r#"SELECT msg_id, read_ct, enqueued_at as "enqueued_at: chrono::DateTime<Utc>", vt as "vt: chrono::DateTime<Utc>", message from pgmq.read(queue_name=>$1::text, vt=>$2::integer, qty=>$3::integer)"#,
+                ).bind(queue_name)
+                .bind(vt)
+                .bind(1)
+                .fetch_optional(executor)
+                .await?;
+            }
+        }
+
         match row {
             Some(row) => {
                 // happy path - successfully read a message
-                let raw_msg = row.message.expect("no message");
+                let raw_msg = row.try_get("message")?;
                 let parsed_msg = serde_json::from_value::<T>(raw_msg)?;
+
                 Ok(Some(Message {
-                    msg_id: row.msg_id.expect("msg_id missing from queue table"),
-                    vt: row.vt.expect("vt missing from queue table"),
-                    read_ct: row.read_ct.expect("read_ct missing from queue table"),
+                    msg_id: row.try_get("msg_id")?,
+                    vt: row.try_get("vt")?,
+                    read_ct: row.try_get("read_ct")?,
                     enqueued_at: row
-                        .enqueued_at
-                        .expect("enqueued_at missing from queue table"),
+                        .try_get("enqueued_at")?,
                     message: parsed_msg,
                 }))
             }
@@ -374,9 +493,72 @@ impl PGMQueueExt {
         self.read_with_cxn(queue_name, vt, &self.connection).await
     }
 
+    #[cfg(feature="deadpool-postgres")]
     pub async fn read_batch_with_poll_with_cxn<
         'c,
-        E: sqlx::Executor<'c, Database = Postgres>,
+        E: GenericClient,
+        T: for<'de> Deserialize<'de>,
+    >(
+        &self,
+        queue_name: &str,
+        vt: i32,
+        max_batch_size: i32,
+        poll_timeout: Option<std::time::Duration>,
+        poll_interval: Option<std::time::Duration>,
+        executor: &E,
+    ) -> Result<Option<Vec<Message<T>>>, PgmqError> {
+        check_input(queue_name)?;
+        let poll_timeout_s = poll_timeout.map_or(DEFAULT_POLL_TIMEOUT_S, |t| t.as_secs() as i32);
+        let poll_interval_ms =
+            poll_interval.map_or(DEFAULT_POLL_INTERVAL_MS, |i| i.as_millis() as i32);
+
+        let result = executor.query(
+            r#"SELECT msg_id, read_ct, enqueued_at as "enqueued_at: chrono::DateTime<Utc>", vt as "vt: chrono::DateTime<Utc>", message from pgmq.read_with_poll(
+                queue_name=>$1::text,
+                vt=>$2::integer,
+                qty=>$3::integer,
+                max_poll_seconds=>$4::integer,
+                poll_interval_ms=>$5::integer
+            )"#,
+            &[
+                &queue_name,
+                &vt,
+                &max_batch_size,
+                &poll_timeout_s,
+                &poll_interval_ms
+            ]
+        )
+        .await;
+
+        match result {
+            #[cfg(feature = "sqlx")]
+            Err(sqlx::error::Error::RowNotFound) => Ok(None),
+            Err(e) => Err(e)?,
+            Ok(rows) => {
+                // happy path - successfully read messages
+                let mut messages: Vec<Message<T>> = Vec::new();
+                for row in rows.iter() {
+                    let raw_msg = row.try_get("message")?;
+                    let parsed_msg = serde_json::from_value::<T>(raw_msg)?;
+
+                    messages.push(Message {
+                        msg_id: row.try_get("msg_id")?,
+                        vt: row.try_get("vt")?,
+                        read_ct: row.try_get("read_ct")?,
+                        enqueued_at: row
+                            .try_get("enqueued_at")?,
+                        message: parsed_msg,
+                    })
+                }
+                Ok(Some(messages))
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlx")]
+    pub async fn read_batch_with_poll_with_cxn<
+        'c,
+        E: sqlx::Executor<'c, Database = sqlx::Postgres>,
         T: for<'de> Deserialize<'de>,
     >(
         &self,
@@ -391,6 +573,7 @@ impl PGMQueueExt {
         let poll_timeout_s = poll_timeout.map_or(DEFAULT_POLL_TIMEOUT_S, |t| t.as_secs() as i32);
         let poll_interval_ms =
             poll_interval.map_or(DEFAULT_POLL_INTERVAL_MS, |i| i.as_millis() as i32);
+
         let result = sqlx::query!(
             r#"SELECT msg_id, read_ct, enqueued_at as "enqueued_at: chrono::DateTime<Utc>", vt as "vt: chrono::DateTime<Utc>", message from pgmq.read_with_poll(
                 queue_name=>$1::text,
@@ -409,6 +592,7 @@ impl PGMQueueExt {
         .await;
 
         match result {
+            #[cfg(feature="sqlx")]
             Err(sqlx::error::Error::RowNotFound) => Ok(None),
             Err(e) => Err(e)?,
             Ok(rows) => {
@@ -450,11 +634,33 @@ impl PGMQueueExt {
             max_batch_size,
             poll_timeout,
             poll_interval,
-            &self.connection,
+            #[cfg(feature="deadpool-postgres")]
+            &self.connection.get().await?,
+            #[cfg(feature="sqlx")]
+            &self.connection
         )
         .await
     }
 
+    #[cfg(feature="deadpool-postgres")]
+    pub async fn archive_with_cxn<'c, E: GenericClient>(
+        &self,
+        queue_name: &str,
+        msg_id: i64,
+        executor: &E,
+    ) -> Result<bool, PgmqError> {
+        check_input(queue_name)?;
+        let arch = executor.query_one(
+            "SELECT * from pgmq.archive(queue_name=>$1::text, msg_id=>$2::bigint)",
+            &[
+&queue_name,
+            &msg_id
+            ]
+        )
+        .await?;
+        Ok(arch.try_get("archive")?)
+    }
+    #[cfg(feature="sqlx")]
     pub async fn archive_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
         &self,
         queue_name: &str,
@@ -473,11 +679,36 @@ impl PGMQueueExt {
     }
     /// Move a message to the archive table.
     pub async fn archive(&self, queue_name: &str, msg_id: i64) -> Result<bool, PgmqError> {
-        self.archive_with_cxn(queue_name, msg_id, &self.connection)
+        self.archive_with_cxn(queue_name, msg_id, 
+            #[cfg(feature="deadpool-postgres")]
+            &self.connection.get().await?,
+            #[cfg(feature="sqlx")]
+            &self.connection)
             .await
     }
 
     /// Move a slice of messages to the archive table.
+    #[cfg(feature="deadpool-postgres")]
+    pub async fn archive_batch_with_cxn<'c, E: GenericClient>(
+        &self,
+        queue_name: &str,
+        msg_ids: &[i64],
+        executor: &E,
+    ) -> Result<usize, PgmqError> {
+        check_input(queue_name)?;
+         executor.execute(
+            "SELECT * from pgmq.archive(queue_name=>$1::text, msg_ids=>$2::bigint[])",
+            &[
+                &queue_name,
+                &msg_ids
+            ]
+        )
+        .await?;
+
+        Ok(msg_ids.len())
+    }
+
+    #[cfg(feature="sqlx")]
     pub async fn archive_batch_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
         &self,
         queue_name: &str,
@@ -503,10 +734,53 @@ impl PGMQueueExt {
         queue_name: &str,
         msg_ids: &[i64],
     ) -> Result<usize, PgmqError> {
-        self.archive_batch_with_cxn(queue_name, msg_ids, &self.connection)
+        self.archive_batch_with_cxn(queue_name, msg_ids, 
+            #[cfg(feature="deadpool-postgres")]
+            &self.connection.get().await?,
+            #[cfg(feature="sqlx")]
+            &self.connection)
             .await
     }
 
+    #[cfg(feature="deadpool-postgres")]
+    pub async fn pop_with_cxn<
+        'c,
+        E: GenericClient,
+        T: for<'de> Deserialize<'de>,
+    >(
+        &self,
+        queue_name: &str,
+        executor: &E,
+    ) -> Result<Option<Message<T>>, PgmqError> {
+        check_input(queue_name)?;
+        let row = executor.query_opt(r#"SELECT msg_id, read_ct, enqueued_at as "enqueued_at: chrono::DateTime<Utc>", vt as "vt: chrono::DateTime<Utc>", message from pgmq.pop(queue_name=>$1::text)"#, &[
+&queue_name
+        ])
+            .await?;
+        match row {
+            Some(row) => {
+                // happy path - successfully read a message
+                let raw_msg = row.try_get("message")?;
+                let parsed_msg = serde_json::from_value::<T>(raw_msg)?;
+
+                Ok(Some(Message {
+                    msg_id: row.try_get("msg_id")?,
+                    vt: row.try_get("vt")?,
+                    read_ct: row.try_get("read_ct")?,
+                    enqueued_at: row
+                        .
+                        try_get("enqueued_at")?,
+                    message: parsed_msg,
+                }))
+            }
+            None => {
+                // no message found
+                Ok(None)
+            }
+        }
+    }
+
+    #[cfg(feature="sqlx")]
     pub async fn pop_with_cxn<
         'c,
         E: sqlx::Executor<'c, Database = Postgres>,
@@ -546,9 +820,33 @@ impl PGMQueueExt {
         &self,
         queue_name: &str,
     ) -> Result<Option<Message<T>>, PgmqError> {
-        self.pop_with_cxn(queue_name, &self.connection).await
+        self.pop_with_cxn(queue_name, 
+            #[cfg(feature="deadpool-postgres")]
+            &self.connection.get().await?,
+            #[cfg(feature="sqlx")]
+            &self.connection).await
     }
 
+    #[cfg(feature="deadpool-postgres")]
+    pub async fn delete_with_cxn<'c, E: GenericClient>(
+        &self,
+        queue_name: &str,
+        msg_id: i64,
+        executor: E,
+    ) -> Result<bool, PgmqError> {
+        let row = executor.query_one(
+            "SELECT * from pgmq.delete(queue_name=>$1::text, msg_id=>$2::bigint)",
+            &[
+&queue_name,
+            &msg_id
+            ]
+        )
+        .await?;
+
+        Ok(row.try_get("delete")?)
+    }
+
+    #[cfg(feature="sqlx")]
     pub async fn delete_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
         &self,
         queue_name: &str,
@@ -567,10 +865,36 @@ impl PGMQueueExt {
 
     // Delete a message by message id.
     pub async fn delete(&self, queue_name: &str, msg_id: i64) -> Result<bool, PgmqError> {
-        self.delete_with_cxn(queue_name, msg_id, &self.connection)
+        self.delete_with_cxn(queue_name, msg_id, 
+            #[cfg(feature="deadpool-postgres")]
+            self.connection.get().await?,
+            #[cfg(feature="sqlx")]
+            &self.connection)
             .await
     }
 
+    #[cfg(feature="deadpool-postgres")]
+    pub async fn delete_batch_with_cxn<'c, E: GenericClient>(
+        &self,
+        queue_name: &str,
+        msg_id: &[i64],
+        executor: E,
+    ) -> Result<usize, PgmqError> {
+        let qty = executor.query(
+            "SELECT * from pgmq.delete(queue_name=>$1::text, msg_ids=>$2::bigint[])",
+            &[
+&queue_name,
+            &msg_id
+            ]
+        )
+        .await?
+        .len();
+
+        // FIXME: change function signature to Vec<i64> and return rows
+        Ok(qty)
+    }
+
+    #[cfg(feature="sqlx")]
     pub async fn delete_batch_with_cxn<'c, E: sqlx::Executor<'c, Database = Postgres>>(
         &self,
         queue_name: &str,
@@ -592,7 +916,13 @@ impl PGMQueueExt {
 
     // Delete with a slice of message ids
     pub async fn delete_batch(&self, queue_name: &str, msg_id: &[i64]) -> Result<usize, PgmqError> {
-        self.delete_batch_with_cxn(queue_name, msg_id, &self.connection)
+        self.delete_batch_with_cxn(queue_name, msg_id, 
+            
+            #[cfg(feature="deadpool-postgres")]
+            self.connection.get().await?,
+            #[cfg(feature="sqlx")]
+            
+            &self.connection)
             .await
     }
 }

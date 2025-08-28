@@ -12,9 +12,20 @@ use std::env;
 async fn init_queue(qname: &str) -> pgmq::PGMQueue {
     let db_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
-    let queue = pgmq::PGMQueue::new(db_url)
-        .await
-        .expect("failed to connect to postgres");
+
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "deadpool-postgres")] {
+           let connection = pgmq::util::conn_options(&db_url).unwrap()
+            .create_pool(Some(deadpool_postgres::Runtime::Tokio1), tokio_postgres::NoTls)
+            .expect("failed to connect to postgres");
+           let queue = pgmq::PGMQueue {url: db_url, connection};
+        } else {
+            let queue = pgmq::PGMQueue::new(db_url)
+                .await
+                .expect("failed to connect to postgres");
+        }
+    }
+
     // make sure queue doesn't exist before the test
     queue.destroy(qname).await.unwrap();
     // CREATE QUEUE

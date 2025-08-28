@@ -147,11 +147,10 @@
 
 #![doc(html_root_url = "https://docs.rs/pgmq/")]
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::error::Error;
-use sqlx::postgres::PgRow;
-use sqlx::types::chrono::Utc;
-use sqlx::{Pool, Postgres, Row};
+#[cfg(feature = "sqlx")]
+use sqlx::{error::Error, postgres::PgRow, Pool, Postgres, Row};
 
 pub mod errors;
 pub mod pg_ext;
@@ -162,18 +161,26 @@ mod query;
 
 pub use errors::PgmqError;
 pub use pg_ext::PGMQueueExt;
+#[cfg(feature = "deadpool-postgres")]
+use tokio_postgres::types::ToSql;
 pub use types::Message;
 
 use std::time::Duration;
+
+use crate::util::Connection;
 
 /// Main controller for interacting with a queue.
 #[derive(Clone, Debug)]
 pub struct PGMQueue {
     pub url: String,
+    #[cfg(feature = "sqlx")]
     pub connection: Pool<Postgres>,
+    #[cfg(feature = "deadpool-postgres")]
+    pub connection: deadpool_postgres::Pool,
 }
 
 impl PGMQueue {
+    #[cfg(feature = "sqlx")]
     pub async fn new(url: String) -> Result<Self, PgmqError> {
         let con = util::connect(&url, 5).await?;
         Ok(Self {
@@ -184,7 +191,10 @@ impl PGMQueue {
 
     /// BYOP  - bring your own pool
     /// initialize a PGMQ connection with your own SQLx Postgres connection pool
-    pub async fn new_with_pool(pool: Pool<Postgres>) -> Self {
+    pub async fn new_with_pool(
+        #[cfg(feature = "sqlx")] pool: Pool<Postgres>,
+        #[cfg(feature = "deadpool-postgres")] pool: deadpool_postgres::Pool,
+    ) -> Self {
         Self {
             url: "".to_owned(),
             connection: pool,
@@ -214,21 +224,42 @@ impl PGMQueue {
     ///    Ok(())
     /// }
     pub async fn create(&self, queue_name: &str) -> Result<(), PgmqError> {
-        let mut tx = self.connection.begin().await?;
         let setup = query::init_queue_client_only(queue_name, false)?;
-        for q in setup {
-            sqlx::query(&q).execute(&mut *tx).await?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature="deadpool-postgres")] {
+                let mut client = self.connection.get().await?;
+                let tx = client.transaction().await?;
+                for q in setup {
+                    tx.execute(&q, &[]).await?;
+                }
+            } else {
+                let mut tx = self.connection.begin().await?;
+                for q in setup {
+                    sqlx::query(&q).execute(&mut *tx).await?;
+                }
+            }
         }
+
         tx.commit().await?;
         Ok(())
     }
 
     /// Create an unlogged queue
     pub async fn create_unlogged(&self, queue_name: &str) -> Result<(), PgmqError> {
-        let mut tx = self.connection.begin().await?;
         let setup = query::init_queue_client_only(queue_name, true)?;
-        for q in setup {
-            sqlx::query(&q).execute(&mut *tx).await?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                let mut client = self.connection.get().await?;
+                let tx =  client.transaction().await?;
+                for q in setup {
+                    tx.execute(&q, &[]).await?;
+                }
+            } else {
+                let mut tx = self.connection.begin().await?;
+                for q in setup {
+                    sqlx::query(&q).execute(&mut *tx).await?;
+                }
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -259,11 +290,22 @@ impl PGMQueue {
     ///     Ok(())
     /// }
     pub async fn destroy(&self, queue_name: &str) -> Result<(), PgmqError> {
-        let mut tx = self.connection.begin().await?;
         let setup = query::destroy_queue_client_only(queue_name)?;
-        for q in setup {
-            sqlx::query(&q).execute(&mut *tx).await?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature="deadpool-postgres")] {
+                let mut client = self.connection.get().await?;
+                let tx = client.transaction().await?;
+                for q in setup {
+                    tx.execute(&q, &[]).await?;
+                }
+            } else {
+                let mut tx = self.connection.begin().await?;
+                for q in setup {
+                    sqlx::query(&q).execute(&mut *tx).await?;
+                }
+            }
         }
+
         tx.commit().await?;
         Ok(())
     }
@@ -324,10 +366,20 @@ impl PGMQueue {
         message: &T,
     ) -> Result<i64, PgmqError> {
         let msg = serde_json::json!(&message);
-        let row: PgRow = sqlx::query(&query::enqueue(queue_name, 1, &0)?)
-            .bind(msg)
-            .fetch_one(&self.connection)
-            .await?;
+        let query = &query::enqueue(queue_name, 1, &0)?;
+
+        cfg_if::cfg_if! {
+            if #[cfg(feature="deadpool-postgres")] {
+                let client = self.connection.get().await?;
+                let row = client.query_one(query, &[&msg]).await?;
+            } else {
+                let row: PgRow = sqlx::query(query)
+                    .bind(msg)
+                    .fetch_one(&self.connection)
+                    .await?;
+            }
+
+        }
         let msg_id: i64 = row.get("msg_id");
         Ok(msg_id)
     }
@@ -390,11 +442,19 @@ impl PGMQueue {
         delay: u64,
     ) -> Result<i64, PgmqError> {
         let msg = serde_json::json!(&message);
-        let row: PgRow = sqlx::query(&query::enqueue(queue_name, 1, &delay)?)
-            .bind(msg)
-            .fetch_one(&self.connection)
-            .await?;
-        let msg_id: i64 = row.get("msg_id");
+        let query = query::enqueue(queue_name, 1, &delay)?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature="deadpool-postgres")] {
+                let row = self.connection.get().await?.query_one(&query, &[&msg]).await?;
+            } else {
+                let row: PgRow = sqlx::query(&query)
+                    .bind(msg)
+                    .fetch_one(&self.connection)
+                    .await?;
+            }
+        }
+
+        let msg_id: i64 = row.try_get("msg_id")?;
         Ok(msg_id)
     }
 
@@ -492,16 +552,30 @@ impl PGMQueue {
         messages: &[T],
         delay: u64,
     ) -> Result<Vec<i64>, PgmqError> {
-        let mut msg_ids: Vec<i64> = Vec::new();
         let query = query::enqueue(queue_name, messages.len(), &delay)?;
-        let mut q = sqlx::query(&query);
-        for msg in messages.iter() {
-            q = q.bind(serde_json::json!(msg));
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                let values = messages.iter().map(|x| serde_json::json!(x)).collect::<Vec<_>>();
+                let mut params:Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(messages.len());
+                for x in values.iter() {
+                    params.push(x);
+                }
+                let rows = self.connection.get().await?.query(&query, &params).await?;
+            } else {
+                let mut q = sqlx::query(&query);
+                for msg in messages.iter() {
+                    q = q.bind(serde_json::json!(msg));
+                }
+
+                let rows: Vec<PgRow> = q.fetch_all(&self.connection).await?;
+            }
         }
-        let rows: Vec<PgRow> = q.fetch_all(&self.connection).await?;
+
+        let mut msg_ids: Vec<i64> = Vec::new();
         for row in rows.iter() {
             msg_ids.push(row.get("msg_id"));
         }
+
         Ok(msg_ids)
     }
 
@@ -749,12 +823,19 @@ impl PGMQueue {
     ///     Ok(())
     /// }
     pub async fn delete(&self, queue_name: &str, msg_id: i64) -> Result<u64, PgmqError> {
-        let query = &query::delete_batch(queue_name)?;
-        let row = sqlx::query(query)
-            .bind(vec![msg_id])
-            .execute(&self.connection)
-            .await?;
-        let num_deleted = row.rows_affected();
+        let query = query::delete_batch(queue_name)?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature="deadpool-postgres")] {
+                let num_deleted = self.connection.get().await?.execute(&query, &[&vec![msg_id]]).await?;
+            } else {
+                let num_deleted = sqlx::query(&query)
+                .bind(vec![msg_id])
+                .execute(&self.connection)
+                .await?
+                .rows_affected();
+            }
+        };
+
         Ok(num_deleted)
     }
 
@@ -802,18 +883,31 @@ impl PGMQueue {
     /// }
     pub async fn delete_batch(&self, queue_name: &str, msg_ids: &[i64]) -> Result<u64, PgmqError> {
         let query = &query::delete_batch(queue_name)?;
-        let row = sqlx::query(query)
-            .bind(msg_ids)
-            .execute(&self.connection)
-            .await?;
-        let num_deleted = row.rows_affected();
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                let num_deleted = self.connection.get().await?.execute(query, &[&msg_ids])
+                .await?;
+            } else {
+                let num_deleted = sqlx::query(query)
+                    .bind(msg_ids)
+                    .execute(&self.connection)
+                    .await?
+                    .rows_affected();
+            }
+        };
         Ok(num_deleted)
     }
 
     pub async fn purge(&self, queue_name: &str) -> Result<u64, PgmqError> {
-        let query = &query::purge_queue(queue_name)?;
-        let row = sqlx::query(query).execute(&self.connection).await?;
-        let num_deleted = row.rows_affected();
+        let query = query::purge_queue(queue_name)?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                let num_deleted = self.connection.get().await?.execute(&query, &[]).await?;
+            } else {
+                let row = sqlx::query(&query).execute(&self.connection).await?;
+                let num_deleted = row.rows_affected();
+            }
+        }
         Ok(num_deleted)
     }
 
@@ -899,14 +993,19 @@ impl PGMQueue {
     /// }
     pub async fn archive_batch(&self, queue_name: &str, msg_ids: &[i64]) -> Result<u64, PgmqError> {
         let query = query::archive_batch(queue_name)?;
-        let row = sqlx::query(&query)
-            .bind(msg_ids)
-            .execute(&self.connection)
-            .await?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "deadpool-postgres")] {
+                let num_achieved = self.connection.get().await?.execute(&query, &[&msg_ids]).await?;
+            } else {
+                let num_achieved = sqlx::query(&query)
+                    .bind(msg_ids)
+                    .execute(&self.connection)
+                    .await?
+                    .rows_affected();
+            }
+        }
 
-        let num_achived = row.rows_affected();
-
-        Ok(num_achived)
+        Ok(num_achieved)
     }
     /// Reads single message from the queue and delete it at the same time.
     /// Similar to [read](#method.read) and [read_batch](#method.read_batch),
@@ -1021,10 +1120,16 @@ impl PGMQueue {
 // This function is intended for internal use.
 async fn fetch_messages<T: for<'de> Deserialize<'de>>(
     query: &str,
-    connection: &Pool<Postgres>,
+    connection: &Connection,
 ) -> Result<Option<Vec<Message<T>>>, PgmqError> {
     let mut messages: Vec<Message<T>> = Vec::new();
-    let result: Result<Vec<PgRow>, Error> = sqlx::query(query).fetch_all(connection).await;
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "deadpool-postgres")] {
+            let result = connection.get().await?.query(query, &[]).await;
+        } else {
+            let result: Result<Vec<PgRow>, Error> = sqlx::query(query).fetch_all(connection).await;
+        }
+    }
     match result {
         Ok(rows) => {
             if rows.is_empty() {
